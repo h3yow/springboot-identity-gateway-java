@@ -1,0 +1,4 @@
+package com.github.h3yow.springbootidentitygatewayjava.web.dto;
+
+public record RefreshRequest(String refreshToken) {
+}
