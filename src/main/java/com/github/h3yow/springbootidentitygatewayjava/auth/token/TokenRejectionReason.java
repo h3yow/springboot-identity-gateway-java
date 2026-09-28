@@ -10,5 +10,7 @@ public enum TokenRejectionReason {
     REVOKED,
     ROTATED,
     UNKNOWN,
-    WRONG_TYPE
+    WRONG_TYPE,
+    /** 会话因同账号达到容量上限被淘汰（与主动撤销、自然过期区分）。 */
+    EVICTED
 }

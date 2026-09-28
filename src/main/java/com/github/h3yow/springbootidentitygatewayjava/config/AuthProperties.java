@@ -31,6 +31,9 @@ public class AuthProperties {
     /** 本地开发模式：step1 响应中回显验证码，便于无外发渠道时本地验证。 */
     private boolean exposeOtpForLocalDev = true;
 
+    /** 单个账号允许同时有效的最大会话数；0 或负数表示不限制。 */
+    private int maxSessionsPerUser = 5;
+
     public int getMaxFailures() { return maxFailures; }
     public void setMaxFailures(int maxFailures) { this.maxFailures = maxFailures; }
 
@@ -51,4 +54,7 @@ public class AuthProperties {
 
     public boolean isExposeOtpForLocalDev() { return exposeOtpForLocalDev; }
     public void setExposeOtpForLocalDev(boolean exposeOtpForLocalDev) { this.exposeOtpForLocalDev = exposeOtpForLocalDev; }
+
+    public int getMaxSessionsPerUser() { return maxSessionsPerUser; }
+    public void setMaxSessionsPerUser(int maxSessionsPerUser) { this.maxSessionsPerUser = maxSessionsPerUser; }
 }

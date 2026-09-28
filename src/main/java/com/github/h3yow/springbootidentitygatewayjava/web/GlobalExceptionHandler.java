@@ -2,6 +2,7 @@ package com.github.h3yow.springbootidentitygatewayjava.web;
 
 import com.github.h3yow.springbootidentitygatewayjava.auth.login.LoginException;
 import com.github.h3yow.springbootidentitygatewayjava.auth.login.LoginFailureReason;
+import com.github.h3yow.springbootidentitygatewayjava.auth.session.SessionException;
 import com.github.h3yow.springbootidentitygatewayjava.auth.token.TokenException;
 import com.github.h3yow.springbootidentitygatewayjava.web.dto.ApiError;
 import org.slf4j.Logger;
@@ -60,5 +61,16 @@ public class GlobalExceptionHandler {
         log.warn("请求参数错误: {}", ex.getMessage());
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(new ApiError("bad_request", "INVALID_ARGUMENT", ex.getMessage()));
+    }
+
+    /**
+     * 会话不存在或不属于当前用户：统一返回 404 SESSION_NOT_FOUND，
+     * 不向调用方区分“不存在”与“他人的会话”，避免会话 id 枚举。
+     */
+    @ExceptionHandler(SessionException.class)
+    public ResponseEntity<ApiError> handleSession(SessionException ex) {
+        log.warn("会话操作失败: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(new ApiError("session_error", "SESSION_NOT_FOUND", ex.getMessage()));
     }
 }

@@ -2,6 +2,7 @@ package com.github.h3yow.springbootidentitygatewayjava.web;
 
 import com.github.h3yow.springbootidentitygatewayjava.auth.domain.UserAccount;
 import com.github.h3yow.springbootidentitygatewayjava.auth.domain.UserDirectory;
+import com.github.h3yow.springbootidentitygatewayjava.auth.login.LoginClientContext;
 import com.github.h3yow.springbootidentitygatewayjava.auth.login.LoginException;
 import com.github.h3yow.springbootidentitygatewayjava.auth.login.LoginFailureReason;
 import com.github.h3yow.springbootidentitygatewayjava.auth.login.LoginService;
@@ -59,7 +60,7 @@ public class AuthController {
         return ResponseEntity.ok(response);
     }
 
-    /** 第二步：OTP 换令牌。 */
+    /** 第二步：OTP 换令牌。可携带 deviceId/deviceName/clientId 以区分多端会话。 */
     @PublicEndpoint
     @PostMapping("/login/otp")
     public IssuedTokens otpStep(@RequestBody Map<String, String> body) {
@@ -67,8 +68,11 @@ public class AuthController {
         String otp = required(body, "otp");
         String authenticated = loginService.verifyOtp(username, otp);
         UserAccount account = requireAccount(authenticated);
-        IssuedTokens tokens = tokenService.issueFor(account);
-        log.info("第二步成功，已签发令牌: username={}", authenticated);
+        LoginClientContext client = new LoginClientContext(
+                optional(body, "deviceId"), optional(body, "deviceName"), optional(body, "clientId"));
+        IssuedTokens tokens = tokenService.issueFor(account, client);
+        log.info("第二步成功，已签发令牌: username={}, sessionId={}, device={}, client={}",
+                authenticated, tokens.sessionId(), client.deviceId(), client.clientId());
         return tokens;
     }
 
@@ -102,5 +106,10 @@ public class AuthController {
             throw new IllegalArgumentException("缺少必填参数: " + key);
         }
         return value;
+    }
+
+    private static String optional(Map<String, String> body, String key) {
+        String value = body == null ? null : body.get(key);
+        return value == null || value.isBlank() ? null : value;
     }
 }
