@@ -5,6 +5,7 @@ import com.github.h3yow.springbootidentitygatewayjava.auth.domain.UserDirectory;
 import com.github.h3yow.springbootidentitygatewayjava.auth.login.LoginException;
 import com.github.h3yow.springbootidentitygatewayjava.auth.login.LoginFailureReason;
 import com.github.h3yow.springbootidentitygatewayjava.auth.login.LoginService;
+import com.github.h3yow.springbootidentitygatewayjava.auth.session.ClientInfo;
 import com.github.h3yow.springbootidentitygatewayjava.auth.token.IssuedTokens;
 import com.github.h3yow.springbootidentitygatewayjava.auth.token.TokenService;
 import com.github.h3yow.springbootidentitygatewayjava.config.AuthProperties;
@@ -59,7 +60,7 @@ public class AuthController {
         return ResponseEntity.ok(response);
     }
 
-    /** 第二步：OTP 换令牌。 */
+    /** 第二步：OTP 换令牌。请求体可选携带 deviceType/deviceName/clientId 用于区分多端。 */
     @PublicEndpoint
     @PostMapping("/login/otp")
     public IssuedTokens otpStep(@RequestBody Map<String, String> body) {
@@ -67,8 +68,11 @@ public class AuthController {
         String otp = required(body, "otp");
         String authenticated = loginService.verifyOtp(username, otp);
         UserAccount account = requireAccount(authenticated);
-        IssuedTokens tokens = tokenService.issueFor(account);
-        log.info("第二步成功，已签发令牌: username={}", authenticated);
+        ClientInfo client = new ClientInfo(
+                optional(body, "deviceType"), optional(body, "deviceName"), optional(body, "clientId"));
+        IssuedTokens tokens = tokenService.issueFor(account, client);
+        log.info("第二步成功，已签发令牌: username={}, deviceType={}, clientId={}",
+                authenticated, client.deviceType(), client.clientId());
         return tokens;
     }
 
@@ -102,5 +106,11 @@ public class AuthController {
             throw new IllegalArgumentException("缺少必填参数: " + key);
         }
         return value;
+    }
+
+    /** 读取可选字段：空串归一为 null。 */
+    private static String optional(Map<String, String> body, String key) {
+        String value = body == null ? null : body.get(key);
+        return value == null || value.isBlank() ? null : value;
     }
 }

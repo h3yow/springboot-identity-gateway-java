@@ -2,6 +2,8 @@ package com.github.h3yow.springbootidentitygatewayjava.web;
 
 import com.github.h3yow.springbootidentitygatewayjava.auth.login.LoginException;
 import com.github.h3yow.springbootidentitygatewayjava.auth.login.LoginFailureReason;
+import com.github.h3yow.springbootidentitygatewayjava.auth.session.SessionException;
+import com.github.h3yow.springbootidentitygatewayjava.auth.session.SessionFailureReason;
 import com.github.h3yow.springbootidentitygatewayjava.auth.token.TokenException;
 import com.github.h3yow.springbootidentitygatewayjava.web.dto.ApiError;
 import org.slf4j.Logger;
@@ -60,5 +62,15 @@ public class GlobalExceptionHandler {
         log.warn("请求参数错误: {}", ex.getMessage());
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(new ApiError("bad_request", "INVALID_ARGUMENT", ex.getMessage()));
+    }
+
+    /** 会话管理操作：他人会话 -> 403，会话不存在 -> 404，reason 可区分。 */
+    @ExceptionHandler(SessionException.class)
+    public ResponseEntity<ApiError> handleSession(SessionException ex) {
+        HttpStatus status = ex.getReason() == SessionFailureReason.SESSION_NOT_OWNED
+                ? HttpStatus.FORBIDDEN : HttpStatus.NOT_FOUND;
+        log.warn("会话操作失败响应: reason={}, status={}, message={}", ex.getReason(), status, ex.getMessage());
+        return ResponseEntity.status(status).body(new ApiError(
+                "session_error", ex.getReason().name(), ex.getMessage()));
     }
 }

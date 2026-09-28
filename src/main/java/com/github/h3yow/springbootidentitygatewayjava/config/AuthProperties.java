@@ -25,6 +25,12 @@ public class AuthProperties {
     /** 刷新令牌有效期（毫秒）。 */
     private long refreshTokenTtlMillis = 7 * 24 * 60 * 60_000L;
 
+    /**
+     * 单个账号同时有效的最大会话（设备）数量；达到上限后新登录优先淘汰最久未活跃会话。
+     * 小于等于 0 表示不限制（保留不启用容量上限时的既有行为）。
+     */
+    private int maxSessionsPerUser = 5;
+
     /** 令牌签名密钥（HMAC-SHA256，Base64URL 编码）。 */
     private String tokenSigningKey = "ZGVmYXVsdC1sb2NhbC1kZXYta2V5LWNoYW5nZS1tZS1wbGVhc2U=";
 
@@ -45,6 +51,9 @@ public class AuthProperties {
 
     public long getRefreshTokenTtlMillis() { return refreshTokenTtlMillis; }
     public void setRefreshTokenTtlMillis(long refreshTokenTtlMillis) { this.refreshTokenTtlMillis = refreshTokenTtlMillis; }
+
+    public int getMaxSessionsPerUser() { return maxSessionsPerUser; }
+    public void setMaxSessionsPerUser(int maxSessionsPerUser) { this.maxSessionsPerUser = maxSessionsPerUser; }
 
     public String getTokenSigningKey() { return tokenSigningKey; }
     public void setTokenSigningKey(String tokenSigningKey) { this.tokenSigningKey = tokenSigningKey; }
