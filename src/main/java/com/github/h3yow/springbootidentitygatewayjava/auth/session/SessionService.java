@@ -56,6 +56,15 @@ public class SessionService {
      * @return 撤销完成后该会话的终止状态
      */
     public SessionState revokeSession(String username, String sessionId) {
+        return revokeSession(username, sessionId, null);
+    }
+
+    /**
+     * 精准撤销的测试专用重载：撤销写入完成、终态已确定后回调 {@code onCommitted}（仍持有族锁）。
+     * 生产代码恒传 {@code null}，行为与 {@link #revokeSession(String, String)} 完全一致；
+     * 仅供确定性并发测试在“撤销已生效、访问仍持锁暂停”这个确定时刻编排线程。
+     */
+    public SessionState revokeSession(String username, String sessionId, Runnable onCommitted) {
         TokenFamily family = store.findFamily(sessionId)
                 .orElseThrow(() -> {
                     log.warn("精准撤销拒绝: 依据=会话不存在 user={}, sessionId={}", username, sessionId);
@@ -76,7 +85,11 @@ public class SessionService {
                 // 已撤销/已淘汰：重复操作结论一致，不抛异常、不改变先到先得的终态
                 log.info("精准撤销幂等返回: user={}, sessionId={}, 当前终态={}", username, fid, current.state());
             }
-            return store.findFamily(fid).map(TokenFamily::state).orElse(SessionState.REVOKED);
+            SessionState resulting = store.findFamily(fid).map(TokenFamily::state).orElse(SessionState.REVOKED);
+            if (onCommitted != null) {
+                onCommitted.run();
+            }
+            return resulting;
         });
     }
 

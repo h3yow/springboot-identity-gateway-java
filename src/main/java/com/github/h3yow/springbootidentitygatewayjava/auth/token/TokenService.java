@@ -132,24 +132,45 @@ public class TokenService {
             log.info("访问令牌拒绝: jti={}, family={}, 依据=已过期 now={} >= exp={}", jti, familyId, now, expiresAt);
             throw new TokenException(TokenRejectionReason.EXPIRED, "访问令牌已过期");
         }
-        TokenFamily family = store.findFamily(familyId)
-                .orElseThrow(() -> new TokenException(TokenRejectionReason.REVOKED, "会话不存在或已撤销"));
-        if (family.state() == SessionState.EVICTED) {
-            log.info("访问令牌拒绝: jti={}, family={}, 依据=会话已被容量上限淘汰", jti, familyId);
-            throw new TokenException(TokenRejectionReason.EVICTED, "会话已因达到并发上限被淘汰，需重新登录");
-        }
-        if (family.terminated()) {
-            log.info("访问令牌拒绝: jti={}, family={}, 依据=所属会话已撤销(主动撤销或重放检测)", jti, familyId);
-            throw new TokenException(TokenRejectionReason.REVOKED, "会话已被撤销");
-        }
-        // 成功访问更新最近活跃（LRU 依据），原子写不与族锁内变更竞争
-        store.putFamily(family.touch(now, family.expiresAt()));
-        return new AccessTokenClaims(
-                jti, familyId, str(payload, "sub"),
-                Set.copyOf(stringList(payload, "roles")),
-                Set.copyOf(stringList(payload, "perms")),
-                Set.copyOf(stringList(payload, "scopes")),
-                longValue(payload, "iat"), expiresAt);
+        // 并发交错插桩点（默认空操作，仅供确定性并发测试在“进入族锁做会话状态判定前”阻塞当前访问）。
+        // 必须在族锁外：此处暂停期间撤销线程仍可拿到族锁先完成撤销，用于编排“撤销先到”的交错。
+        beforeAccessSessionCheck(familyId);
+        // 会话状态判定与“成功访问回写最近活跃”必须在同一把族锁内作为一次读-改-写原子完成，
+        // 与撤销/续期/淘汰串行化。否则访问在锁外读到旧 ACTIVE 快照后，若撤销恰在此时生效，
+        // 紧随其后的 touch 回写会用旧快照把 REVOKED/EVICTED 覆盖回 ACTIVE（“已下线会话复活”）。
+        return store.withFamilyLock(familyId, fid -> {
+            TokenFamily family = store.findFamily(fid)
+                    .orElseThrow(() -> new TokenException(TokenRejectionReason.REVOKED, "会话不存在或已撤销"));
+            if (family.state() == SessionState.EVICTED) {
+                log.info("访问令牌拒绝: jti={}, family={}, 依据=会话已被容量上限淘汰", jti, familyId);
+                throw new TokenException(TokenRejectionReason.EVICTED, "会话已因达到并发上限被淘汰，需重新登录");
+            }
+            if (family.terminated()) {
+                log.info("访问令牌拒绝: jti={}, family={}, 依据=所属会话已撤销(主动撤销或重放检测)", jti, familyId);
+                throw new TokenException(TokenRejectionReason.REVOKED, "会话已被撤销");
+            }
+            // 并发交错插桩点（默认空操作，仅供确定性并发测试：访问已确认快照为 ACTIVE、即将回写最近活跃前）
+            afterAccessSessionLoaded(fid);
+            // 锁内基于刚读到的最新快照回写最近活跃；状态机护栏保证即使快照陈旧，已终止族也不会被写活
+            TokenFamily latest = store.updateActiveFamily(fid, f -> f.touch(now, f.expiresAt()));
+            if (latest == null) {
+                throw new TokenException(TokenRejectionReason.REVOKED, "会话不存在或已撤销");
+            }
+            if (latest.state() == SessionState.EVICTED) {
+                log.info("访问令牌拒绝: jti={}, family={}, 依据=回写前会话已被容量上限淘汰", jti, familyId);
+                throw new TokenException(TokenRejectionReason.EVICTED, "会话已因达到并发上限被淘汰，需重新登录");
+            }
+            if (latest.state() != SessionState.ACTIVE) {
+                log.info("访问令牌拒绝: jti={}, family={}, 依据=回写前会话已被撤销", jti, familyId);
+                throw new TokenException(TokenRejectionReason.REVOKED, "会话已被撤销");
+            }
+            return new AccessTokenClaims(
+                    jti, familyId, str(payload, "sub"),
+                    Set.copyOf(stringList(payload, "roles")),
+                    Set.copyOf(stringList(payload, "perms")),
+                    Set.copyOf(stringList(payload, "scopes")),
+                    longValue(payload, "iat"), expiresAt);
+        });
     }
 
     /**
@@ -189,14 +210,16 @@ public class TokenService {
                 throw new TokenException(TokenRejectionReason.ROTATED,
                         "刷新令牌已被使用（疑似重放），会话已全部撤销，请重新登录");
             }
+            // 并发交错插桩点（默认空操作，仅供确定性并发测试在“续期提交（消费旧令牌/签发新对）前”阻塞）
+            beforeRotateCommit(fid);
             // 原子地消费旧刷新令牌
             store.saveRefreshToken(stored.asUsed());
             // 能力以服务端会话快照为准，保证续期后角色/权限/范围不减少不丢失
             UserAccount account = rehydrateAccount(stored.username(), family);
             IssuedTokens issued = mintPair(family, account, now);
-            // 滑动续期：刷新成功即活跃，会话到期随新刷新令牌顺延
+            // 滑动续期：刷新成功即活跃，会话到期随新刷新令牌顺延；经状态机护栏回写，终止态不可复活
             long refreshExpiry = now + properties.getRefreshTokenTtlMillis();
-            store.putFamily(family.touch(now, refreshExpiry));
+            store.updateActiveFamily(fid, f -> f.touch(now, refreshExpiry));
             log.info("刷新成功并完成轮换: family={}, 已续期能力roles={},perms={},scopes={}, 旧刷新令牌已作废",
                     fid, family.roles(), family.permissions(), family.scopes());
             return issued;
@@ -216,6 +239,8 @@ public class TokenService {
      */
     public void revokeFamilyById(String familyId) {
         store.withFamilyLock(familyId, fid -> {
+            // 并发交错插桩点（默认空操作，仅供确定性并发测试在“撤销写入前、已持族锁”时阻塞）
+            beforeRevokeCommit(fid);
             store.findFamily(fid).ifPresentOrElse(
                     family -> {
                         store.putFamily(family.asRevoked());
@@ -225,6 +250,40 @@ public class TokenService {
                     () -> log.info("撤销请求: family={} 服务端无记录，按幂等返回成功", fid));
             return null;
         });
+    }
+
+    /**
+     * 并发交错插桩点：访问令牌已通过结构/签名/过期校验、尚未进入族锁做会话状态判定时回调（族锁外）。
+     * 默认空操作；确定性并发测试可在此阻塞访问线程，同时让撤销线程先拿到族锁，
+     * 精确制造“撤销先于访问状态判定生效”的交错。
+     */
+    protected void beforeAccessSessionCheck(String familyId) {
+        // no-op
+    }
+
+    /**
+     * 并发交错插桩点：访问已读取会话快照并确认其为 ACTIVE、即将回写最近活跃时间时回调。
+     * 默认空操作；确定性并发测试可覆写以在“读到旧 ACTIVE 快照之后、写入之前”暂停，
+     * 精确复现“撤销夹在访问的读-改-写之间，旧快照把已撤销会话写活”的交错。
+     */
+    protected void afterAccessSessionLoaded(String familyId) {
+        // no-op
+    }
+
+    /**
+     * 并发交错插桩点：刷新轮换已通过全部前置校验、已持族锁，即将消费旧令牌并签发新对时回调。
+     * 默认空操作；确定性并发测试可覆写以精确制造“撤销与续期提交”交错。
+     */
+    protected void beforeRotateCommit(String familyId) {
+        // no-op
+    }
+
+    /**
+     * 并发交错插桩点：撤销已持有族锁、即将写入撤销终态时回调。
+     * 默认空操作；确定性并发测试可覆写以让撤销线程先拿到族锁并暂停。
+     */
+    protected void beforeRevokeCommit(String familyId) {
+        // no-op
     }
 
     /** 在指定族内签发一对新令牌并落库刷新令牌哈希。 */

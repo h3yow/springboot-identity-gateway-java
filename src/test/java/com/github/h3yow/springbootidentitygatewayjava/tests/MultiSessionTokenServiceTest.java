@@ -295,6 +295,38 @@ class MultiSessionTokenServiceTest {
         assertEquals(TokenRejectionReason.REVOKED, revoked.getReason());
     }
 
+    @Test
+    @DisplayName("访问拒绝三区分：主动撤销=REVOKED、容量淘汰=EVICTED、自然过期=EXPIRED，互不混淆")
+    void accessRejectionReasonsAreDistinct() {
+        // —— 容量淘汰的牺牲品：先占满上限，再登录一次把“最久未活跃”的 s0 顶掉 ——
+        IssuedTokens s0 = tokenService.issueFor(alice, client("dev-0", "c0"));
+        clock.advance(1_000L);
+        tokenService.issueFor(alice, client("dev-1", "c1"));
+        clock.advance(1_000L);
+        tokenService.issueFor(alice, client("dev-2", "c2"));
+        clock.advance(1_000L);
+        tokenService.issueFor(alice, client("dev-3", "c3")); // 触发淘汰 s0
+
+        // —— 主动撤销对象 ——
+        IssuedTokens revokedSession = tokenService.issueFor(alice, client("dev-revoke", "c4"));
+        // —— 自然过期对象（族仍 ACTIVE、未撤销、未淘汰）——
+        IssuedTokens expiredSession = tokenService.issueFor(alice, client("dev-expire", "c5"));
+
+        tokenService.revoke(revokedSession.refreshToken());
+        TokenException revokedEx = assertThrows(TokenException.class,
+                () -> tokenService.authenticate(revokedSession.accessToken()));
+        assertEquals(TokenRejectionReason.REVOKED, revokedEx.getReason());
+
+        TokenException evictedEx = assertThrows(TokenException.class,
+                () -> tokenService.authenticate(s0.accessToken()));
+        assertEquals(TokenRejectionReason.EVICTED, evictedEx.getReason());
+
+        clock.advance(properties.getAccessTokenTtlMillis() + 1L);
+        TokenException expiredEx = assertThrows(TokenException.class,
+                () -> tokenService.authenticate(expiredSession.accessToken()));
+        assertEquals(TokenRejectionReason.EXPIRED, expiredEx.getReason());
+    }
+
     private static void await(CountDownLatch latch) {
         try {
             latch.await();

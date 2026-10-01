@@ -1,5 +1,6 @@
 package com.github.h3yow.springbootidentitygatewayjava.auth.token;
 
+import com.github.h3yow.springbootidentitygatewayjava.auth.session.SessionState;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -69,6 +70,34 @@ public class TokenStore {
     /** 直接保存一个更新后的族（须在持有族锁或用户锁时调用，用于滑动续期/淘汰写入）。 */
     public void putFamily(TokenFamily family) {
         families.put(family.familyId(), family);
+    }
+
+    /**
+     * 在族锁内对已存在的族做一次受状态机约束的条件更新（用于成功访问/续期的最近活跃回写）。
+     *
+     * <p>状态机护栏：当前族已进入终止态（REVOKED/EVICTED）时，拒绝任何会把它改回 ACTIVE 的写入，
+     * 终态“先到先得”且不可逆，从存储层杜绝“撤销生效后又被旧快照写活”。仅当当前族仍为 ACTIVE 时，
+     * 才应用更新函数。
+     *
+     * @return 当前最新族；若调用方据此判断已终止，应按 REVOKED/EVICTED 拒绝本次请求
+     */
+    public TokenFamily updateActiveFamily(String familyId,
+                                          java.util.function.UnaryOperator<TokenFamily> update) {
+        return families.compute(familyId, (id, current) -> {
+            if (current == null) {
+                return null;
+            }
+            if (current.state() != SessionState.ACTIVE) {
+                // 已撤销/已淘汰：终态不可逆，保留当前快照，拒绝复活写入（不改建立/活跃时间等任何字段）
+                return current;
+            }
+            TokenFamily updated = update.apply(current);
+            if (updated.state() != SessionState.ACTIVE) {
+                // 活跃回写路径只允许仍为 ACTIVE 的结果；任何意外的状态翻转都不接受
+                throw new IllegalStateException("活跃会话回写不得改变终止状态: family=" + id);
+            }
+            return updated;
+        });
     }
 
     /**
