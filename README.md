@@ -9,7 +9,7 @@
 ## 1. 技术栈与运行要求
 
 - Java 21+、Spring Boot 3.4.x、Spring MVC、JDK 内置 PBKDF2 / HMAC-SHA256
-- 无外部中间件；构建：`mvn test`（含 53 个测试）
+- 无外部中间件；构建：`mvn test`（含 62 个测试）
 
 ## 2. 演示账户（内存播种，仅用于本地）
 
@@ -133,11 +133,26 @@ POST /api/sessions/{sessionId}/revoke     （需登录）
 - 越权操作他人会话 → `403 SESSION_NOT_OWNED`；会话不存在/已从存储消失 → `404 SESSION_NOT_FOUND`。
 - 旧的 `POST /api/auth/token/revoke { refreshToken }` 保持可用（撤销该刷新令牌所属整族）。
 
-### 5.4 撤销与续期竞争自洽
+### 5.4 撤销与访问/续期竞争自洽（撤销一旦生效即不可再被激活）
 
-撤销与刷新都在**族锁**内串行判定。若撤销先持锁，随后到达的续期看到 REVOKED 被拒，不会再换出新凭证；
-若续期先一步成功，其刚换出的新 access/refresh 也会因紧接着的撤销立即失效（REVOKED）。
-无论两个请求怎样交错，最终族一定处于 REVOKED，且不会出现“撤销已生效、过一会儿又换出新凭证继续能用”。
+撤销、访问的状态判定与活跃时间写回、续期都在**族锁**内串行判定，且存储层对会话状态做
+**单调保护**：会话终态（REVOKED / EVICTED）一旦写入，任何携带 ACTIVE 旧快照的覆盖写
+（`putFamily`/`touchIfActive`）都会被丢弃——终态只能在 ACTIVE→REVOKED/EVICTED 之间单向转移，
+不可能被“读-改-写”的丢失更新重新写活。
+
+- 若**撤销先**持锁：随后到达的访问当场得到 `REVOKED`、续期当场得到 `REVOKED`，不会再换出新凭证；
+  被拒请求也不会改动会话的建立时间、最近活跃时间。
+- 若**访问/续期先**一步成功：这次访问可按成功处理（或续期先换出一对新令牌），但紧接着的撤销仍会让
+  该会话最终停在 REVOKED——刚换出的新 access/refresh 立即失效、不能再续期。
+
+无论“访问 / 续期 / 撤销”怎样交错、反复跑多少次，最终族一定处于终态且结论唯一：
+**撤销接口一旦成功返回，该会话之后的访问与续期就一直被拒，并从会话清单持续消失，
+绝不出现“撤销已生效、过一会儿又冒回清单、还能用刷新令牌换新凭证继续用”。**
+
+> 修复背景：旧实现里访问路径在族锁外读取会话、判定 ACTIVE 后用无条件的整条覆盖写回更新
+> `lastActiveAt`。当“访问读到 ACTIVE 旧快照”与“撤销把族置为 REVOKED”并发时，访问的迟到写回
+> 会用旧 ACTIVE 快照把已撤销的会话整条覆盖“复活”，于是其未消费的刷新令牌又能换新凭证。
+> 现通过“状态判定+写回同处族锁内 + 终态单调条件写（`touchIfActive`/带保护的 `putFamily`）”根除。
 
 ### 5.5 容量上限与 LRU 淘汰
 
@@ -148,8 +163,8 @@ POST /api/sessions/{sessionId}/revoke     （需登录）
   自然过期（EXPIRED）明确区分。
 - 淘汰只影响被选中的一个会话，不连带同账号其它会话；多个登录并发时也绝不超过上限，
   且新建立的会话不会被误伤（淘汰候选只取建立之前已存在的旧会话）。
-- 每次成功访问会更新 `lastActiveAt`（原子写，不与族锁竞争），续期成功会滑动
-  `lastActiveAt` 与会话 `expiresAt`。
+- 每次成功访问在族锁内以“仅 ACTIVE 才更新”的条件写更新 `lastActiveAt`（终态下写回被丢弃），
+  续期成功在族锁内滑动 `lastActiveAt` 与会话 `expiresAt`；两者都不会把已终止会话改回可用。
 
 会话操作相关的拒绝结论：
 
@@ -205,9 +220,13 @@ POST /api/sessions/{sessionId}/revoke     （需登录）
 ### 8.1 自动化测试（推荐，不启动网络端口也能跑单元层）
 
 ```bash
-mvn test                       # 全部 53 个测试
+mvn test                       # 全部 62 个测试
 mvn test -Dtest=TokenServiceTest#concurrentRefreshExactlyOneSuccess
 mvn test -Dtest=MultiSessionTokenServiceTest#revokeAndRotateRaceConsistent
+# 撤销不可复活并发回归（离线确定性，不依赖睡眠）
+mvn test -Dtest=RevocationConcurrencyTest
+mvn test -Dtest=RevocationConcurrencyTest#concurrentAccessAndRotateAgainstRevokeAlwaysSettlesRevoked
+mvn test -Dtest=RevocationConcurrencyTest#staleActiveWriteAfterRevokeCannotReactivateSession
 ```
 
 测试分层：
@@ -222,6 +241,12 @@ mvn test -Dtest=MultiSessionTokenServiceTest#revokeAndRotateRaceConsistent
 - `MultiSessionTokenServiceTest`（7）：容量上限与 LRU 选择、被淘汰会话访问/续期得
   EVICTED 且与 REVOKED/EXPIRED 区分、淘汰不连带、**50 轮撤销/续期竞争自洽**、
   **12 线程并发登录不超上限且新会话不被误伤**、续期后角色/权限/范围不丢失。
+- `RevocationConcurrencyTest`（9）：**“撤销一旦生效即不可再被激活”并发回归**。包括
+  存储层终态单调不变量（旧 ACTIVE 快照不能把 REVOKED/EVICTED 写活）、无线程的根因确定性复现
+  （访问读到 ACTIVE→撤销生效→访问迟到写回仍不得复活）、用 latch 精确构造的两种锁序交错
+  （访问持锁撤销排队 / 撤销先完成访问被拒）、**100 轮“8 访问线程 + 1 续期线程 与 撤销线程”真并发**
+  断言终态恒 REVOKED 且新旧凭证全失效、同账号其它设备会话不受连带、以及 REVOKED/EVICTED/EXPIRED
+  三类拒绝结论互不串味。全程用 `MutableClock` 与 CountDownLatch/CyclicBarrier 汇合，无真实睡眠。
 - `AccessControlServiceTest`（8）：三类拒绝原因边界、401 与 403 可区分。
 - `AuthFlowIntegrationTest`（5）：MockMvc 全链路 HTTP 状态码与 reason 断言，
   时钟固定为 `MutableClock`，每个用例前清空 OTP/失败计数/令牌存储保证隔离。
@@ -234,6 +259,34 @@ mvn test -Dtest=MultiSessionTokenServiceTest#revokeAndRotateRaceConsistent
 ```bash
 mvn test -Dtest=LoginServiceTest 2>&1 | grep -E "OTP|锁定|判定"
 ```
+
+### 8.1.1 如何复现并验证“撤销后又复活 / 又能换新凭证”的并发缺陷
+
+该缺陷的本质是丢失更新，不需要真实等待或多线程调度也能确定性复现（时间走可控时钟）：
+
+1. 登录建立手机会话，访问一次受保护接口，让其持有一个 **ACTIVE 会话快照**；
+2. 用另一台设备调用 `POST /api/sessions/{sessionId}/revoke` 精准撤销该手机会话（返回 200、state=REVOKED）；
+3. 让第 1 步“在撤销前已开始、撤销后才写回”的在途访问，把手里的 ACTIVE 旧快照写回。
+   - 旧实现（无条件整条覆盖）会把已 REVOKED 的会话覆盖回 ACTIVE，于是该会话冒回清单，
+     其原 refresh token 还能 `POST /api/auth/token/refresh` 换出一对全新可用凭证——即缺陷；
+   - 修复后（状态判定+写回同处族锁、终态单调条件写）这次迟到写回被丢弃，会话保持 REVOKED，
+     随后访问得 401 `UNAUTHENTICATED`（令牌层原因 `REVOKED`）、续期得 401 `REVOKED`，清单持续为空。
+
+对应自动化用例（离线、可重复、无睡眠）：
+
+```bash
+# 确定性根因复现 + 100 轮真并发 + 两种锁序交错 + 三类拒绝结论区分
+mvn test -Dtest=RevocationConcurrencyTest
+```
+
+- `staleActiveWriteAfterRevokeCannotReactivateSession`：无线程、确定性地走上面 3 步；
+- `concurrentAccessAndRotateAgainstRevokeAlwaysSettlesRevoked`：100 轮、每轮 8 个访问线程
+  + 1 个续期线程与 1 个撤销线程从同一屏障并发，反复验证终态唯一为 REVOKED、新凭证全失效、
+  同账号其它设备不受影响；
+- `accessHoldingLockThenQueuedRevokeEndsRevoked` / `revokeCompletesFirstThenAccessRejected`：
+  用 `CountDownLatch` 精确钉住“访问持锁/撤销排队”与“撤销先完成/访问被拒”两种交错。
+
+> 这些用例在旧的有缺陷实现上会失败（断言 REVOKED 实际为 ACTIVE），在修复实现上全部通过。
 
 ### 8.2 手工 curl（真实 HTTP 闭环）
 
@@ -280,8 +333,10 @@ curl -s -X POST localhost:8080/api/sessions/<sessionId>/revoke \
 - **内存状态**：OTP 挑战、失败计数、令牌族/刷新记录均在内存，重启即清空，符合
   “本地可运行、无外部服务”的目标；生产化时把 Store/Counter 换成持久实现即可，
   接口语义（原子消费、族级锁/用户级锁、窗口判定、LRU 选择）保持不变。
-- **两级锁**：族锁串行化同一会话的轮换/撤销/淘汰；用户锁串行化同一账号“建会话 + 容量淘汰”，
-  固定“先用户锁后族锁”的加锁顺序，既保证并发登录不超上限、不误伤新会话，也避免锁序死锁。
+- **两级锁 + 终态单调**：族锁串行化同一会话的“访问状态判定/活跃写回/轮换/撤销/淘汰”；
+  用户锁串行化同一账号“建会话 + 容量淘汰”，固定“先用户锁后族锁”的加锁顺序，既保证并发登录不超上限、
+  不误伤新会话，也避免锁序死锁。存储层另以条件写保证终态单调：REVOKED/EVICTED 一旦写入，
+  携带 ACTIVE 旧快照的写回一律丢弃，撤销/淘汰不可能被并发访问或续期“复活”。
 - **能力服务端快照**：会话的 roles/perms/scopes 存于令牌族，续期据此重签，
   不依赖用户目录的实时内容，保证“清单概要 = 访问令牌判定 = 续期后能力”三者一致、续期不丢能力。
 - **终态先到先得且可区分**：会话终态为 REVOKED / EVICTED / 自然过期三类，分别落到

@@ -132,18 +132,25 @@ public class TokenService {
             log.info("访问令牌拒绝: jti={}, family={}, 依据=已过期 now={} >= exp={}", jti, familyId, now, expiresAt);
             throw new TokenException(TokenRejectionReason.EXPIRED, "访问令牌已过期");
         }
-        TokenFamily family = store.findFamily(familyId)
-                .orElseThrow(() -> new TokenException(TokenRejectionReason.REVOKED, "会话不存在或已撤销"));
-        if (family.state() == SessionState.EVICTED) {
-            log.info("访问令牌拒绝: jti={}, family={}, 依据=会话已被容量上限淘汰", jti, familyId);
-            throw new TokenException(TokenRejectionReason.EVICTED, "会话已因达到并发上限被淘汰，需重新登录");
-        }
-        if (family.terminated()) {
-            log.info("访问令牌拒绝: jti={}, family={}, 依据=所属会话已撤销(主动撤销或重放检测)", jti, familyId);
-            throw new TokenException(TokenRejectionReason.REVOKED, "会话已被撤销");
-        }
-        // 成功访问更新最近活跃（LRU 依据），原子写不与族锁内变更竞争
-        store.putFamily(family.touch(now, family.expiresAt()));
+        // “会话状态判定 + 活跃时间写回”在同一把族锁内一次完成：
+        // 与撤销/淘汰/续期对该会话的写互斥，二者对最终状态只有一个自洽结论——
+        // 要么本请求在锁内看到 ACTIVE 并按成功处理（随后到达的撤销仍会把族置为终态），
+        // 要么在锁内看到 REVOKED/EVICTED 当场拒绝。绝不会再用锁外读到的旧 ACTIVE
+        // 快照把已终止的会话覆盖“写活”。
+        TokenFamily family = store.withFamilyLock(familyId, fid -> {
+            TokenFamily current = store.findFamily(fid)
+                    .orElseThrow(() -> new TokenException(TokenRejectionReason.REVOKED, "会话不存在或已撤销"));
+            if (current.state() == SessionState.EVICTED) {
+                log.info("访问令牌拒绝: jti={}, family={}, 依据=会话已被容量上限淘汰", jti, familyId);
+                throw new TokenException(TokenRejectionReason.EVICTED, "会话已因达到并发上限被淘汰，需重新登录");
+            }
+            if (current.terminated()) {
+                log.info("访问令牌拒绝: jti={}, family={}, 依据=所属会话已撤销(主动撤销或重放检测)", jti, familyId);
+                throw new TokenException(TokenRejectionReason.REVOKED, "会话已被撤销");
+            }
+            // touchIfActive 内部再按当前 ACTIVE 态条件写，双保险：终态永不被旧快照复活
+            return store.touchIfActive(fid, now, current.expiresAt()).orElse(current);
+        });
         return new AccessTokenClaims(
                 jti, familyId, str(payload, "sub"),
                 Set.copyOf(stringList(payload, "roles")),
